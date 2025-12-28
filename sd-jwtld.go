@@ -18,9 +18,9 @@ import (
 	"go.dedis.ch/kyber/v3"
 )
 
-// ----------------------------
-// JSON-LD structs (payload)
-// ----------------------------
+/* ============================================================
+   JSON-LD payload structures
+============================================================ */
 
 type Payload struct {
 	Ver  int8                   `json:"ver,omitempty"`
@@ -28,7 +28,6 @@ type Payload struct {
 	Iss  *IDClaim               `json:"iss,omitempty"`
 	Aud  *IDClaim               `json:"aud,omitempty"`
 	Sub  *IDClaim               `json:"sub,omitempty"`
-	// Data stores SD metadata only (e.g. {"sd":{"alg":"sha256-merkle","root":"<b64>"}})
 	Data map[string]interface{} `json:"data,omitempty"`
 	List []*LDNode              `json:"@list,omitempty"`
 }
@@ -44,76 +43,82 @@ type LDNode struct {
 	Payload *Payload `json:"payload"`
 }
 
-// ----------------------------
-// Helpers JWS (base64url w/o padding)
-// ----------------------------
-var b64 = base64.RawURLEncoding
+/* ============================================================
+   Selective Disclosure claim (NEW)
+============================================================ */
 
-func b64Encode(data []byte) string {
-	return b64.EncodeToString(data)
+type SDClaim struct {
+	ID    string      `json:"id"`
+	Value interface{} `json:"value"`
 }
 
+/* ============================================================
+   Base64 helpers
+============================================================ */
+
+var b64 = base64.RawURLEncoding
+
+func b64Encode(b []byte) string { return b64.EncodeToString(b) }
 func b64Decode(s string) ([]byte, error) {
 	return b64.DecodeString(s)
 }
 
 func marshalCanonical(v interface{}) ([]byte, error) {
-	// For PoC we use json.Marshal (not JSON-LD canonicalization).
 	return json.Marshal(v)
 }
 
-// ----------------------------
-// Data -> canonical leaves helper
-// ----------------------------
+/* ============================================================
+   Data → Merkle leaves (REVISED)
+============================================================ */
 
-// DataToLeaves: converts map[string]interface{} into canonical leaves slice and
-// returns keysOrder (sorted) and leaves (bytes). Leaves are the serialized values
-// (we keep leaf representation as canonicalized value bytes; sd package hashes domain-separated).
+// DataToLeaves now preserves semantic binding by embedding {id,value}
 func DataToLeaves(data map[string]interface{}) (keys []string, leaves [][]byte, err error) {
 	if data == nil {
 		return nil, nil, fmt.Errorf("nil data")
 	}
+
 	keys = make([]string, 0, len(data))
 	for k := range data {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
-	leaves = make([][]byte, 0, len(keys))
 	for _, k := range keys {
-		v := data[k]
-		b, e := marshalCanonical(v)
-		if e != nil {
-			return nil, nil, fmt.Errorf("canonicalize value for key %s: %v", k, e)
+		leafObj := SDClaim{
+			ID:    k,
+			Value: data[k],
 		}
-		// leaf format: we use the raw canonical value bytes (sd package will domain-separate)
+		b, err := marshalCanonical(leafObj)
+		if err != nil {
+			return nil, nil, fmt.Errorf("marshal SDClaim %s: %v", k, err)
+		}
 		leaves = append(leaves, b)
 	}
 	return keys, leaves, nil
 }
 
-// ----------------------------
-// AttachSDRootToPayload
-// - computes Merkle root from provided "data" (map[string]interface{})
-// - sets payload.Data to a JSON-friendly SD metadata object:
-//     payload.Data = { "sd": { "alg":"sha256-merkle", "root":"<base64url>" } }
-// - returns keysOrder and leaves (so caller can create disclosures before or after)
+/* ============================================================
+   Attach SD root
+============================================================ */
+
 func AttachSDRootToPayload(p *Payload, data map[string]interface{}) (keys []string, leaves [][]byte, err error) {
 	if p == nil {
 		return nil, nil, fmt.Errorf("nil payload")
 	}
-	if data == nil || len(data) == 0 {
+	if len(data) == 0 {
 		return nil, nil, fmt.Errorf("no data to attach")
 	}
+
 	keys, leaves, err = DataToLeaves(data)
 	if err != nil {
 		return nil, nil, err
 	}
+
 	root, err := sd.MerkleRoot(leaves)
 	if err != nil {
 		return nil, nil, err
 	}
-	// Replace payload.Data with sd metadata only
+
 	p.Data = map[string]interface{}{
 		"sd": map[string]string{
 			"alg":  "sha256-merkle",
@@ -123,39 +128,47 @@ func AttachSDRootToPayload(p *Payload, data map[string]interface{}) (keys []stri
 	return keys, leaves, nil
 }
 
-// ExtractSDRootFromPayload returns raw root bytes and whether it was present.
 func ExtractSDRootFromPayload(p *Payload) ([]byte, bool) {
 	if p == nil || p.Data == nil {
 		return nil, false
 	}
-	raw, ok := p.Data["sd"]
+	m, ok := p.Data["sd"].(map[string]interface{})
 	if !ok {
 		return nil, false
 	}
-	switch m := raw.(type) {
-	case map[string]interface{}:
-		rs, ok := m["root"].(string)
-		if !ok {
-			return nil, false
-		}
-		b, err := b64Decode(rs)
-		if err != nil {
-			return nil, false
-		}
-		return b, true
-	case map[string]string:
-		rs, ok := m["root"]
-		if !ok {
-			return nil, false
-		}
-		b, err := b64Decode(rs)
-		if err != nil {
-			return nil, false
-		}
-		return b, true
-	default:
+	rs, ok := m["root"].(string)
+	if !ok {
 		return nil, false
 	}
+	b, err := b64Decode(rs)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
+/* ============================================================
+   NEW: Semantic extraction from disclosure
+============================================================ */
+
+// ExtractSDClaimsFromDisclosure parses revealed leaves into SDClaim structs
+func ExtractSDClaimsFromDisclosure(d *sd.Disclosure) ([]SDClaim, error) {
+	if d == nil {
+		return nil, fmt.Errorf("nil disclosure")
+	}
+
+	var claims []SDClaim
+	for _, leaf := range d.Leaves {
+		var c SDClaim
+		if err := json.Unmarshal(leaf, &c); err != nil {
+			return nil, fmt.Errorf("invalid SDClaim leaf: %v", err)
+		}
+		if c.ID == "" {
+			return nil, fmt.Errorf("SDClaim missing id")
+		}
+		claims = append(claims, c)
+	}
+	return claims, nil
 }
 
 // ----------------------------

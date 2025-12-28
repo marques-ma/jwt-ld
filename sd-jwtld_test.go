@@ -248,13 +248,12 @@ func Test_SchoCo_FullSDFlow(t *testing.T) {
 	fmt.Println("Schoco root validated OK")
 
 	// 7️⃣ Criar disclosure seletivo (ex.: só "repo.read")
-	// search index of "repo.read"
 	fmt.Println("Creating disclosure for 'repo.read'")
 	idx := indexOf(keys, "repo.read")
 	if idx < 0 {
 		t.Fatalf("repo.read not found in keys")
 	}
-	// create disclosure for that index
+
 	disc, err := sd.CreateDisclosure(leaves, []int{idx})
 	if err != nil {
 		t.Fatalf("CreateDisclosure schoco: %v", err)
@@ -271,12 +270,29 @@ func Test_SchoCo_FullSDFlow(t *testing.T) {
 	}
 	fmt.Println("Schoco presentation validated OK")
 
-	// 9️⃣ Validar valor revelado
-	fmt.Println("Checking revealed claim 'repo.read' value")
-	expected := "true"
-	if string(disc.Leaves[0]) != expected {
-		t.Fatalf("Claim 'repo.read' value mismatch: got %s, want %s", string(disc.Leaves[0]), expected)
-	}
-	fmt.Println("Claim 'repo.read' value correct")
+	// 9️⃣ Validar claim revelada (SEMÂNTICA)
+	fmt.Println("Checking revealed SD claim")
 
+	claims, err := ExtractSDClaimsFromDisclosure(disc)
+	if err != nil {
+		t.Fatalf("ExtractSDClaimsFromDisclosure failed: %v", err)
+	}
+	if len(claims) != 1 {
+		t.Fatalf("expected 1 revealed claim, got %d", len(claims))
+	}
+
+	c := claims[0]
+
+	if c.ID != "repo.read" {
+		t.Fatalf("unexpected claim id: got %s, want repo.read", c.ID)
+	}
+	val, ok := c.Value.(bool)
+	if !ok {
+		t.Fatalf("claim value is not bool: %T", c.Value)
+	}
+	if val != true {
+		t.Fatalf("claim 'repo.read' value mismatch: got %v, want true", val)
+	}
+
+	fmt.Println("Revealed claim OK:", c.ID, "=", c.Value)
 }
