@@ -15,7 +15,16 @@ import (
 
 	sd "github.com/marques-ma/merkle-selective-disclosure"
 	"github.com/hpe-usp-spire/schoco"
-	"go.dedis.ch/kyber/v3"
+	"filippo.io/edwards25519"
+)
+
+/* ============================================================
+   Version constants
+============================================================ */
+const (
+	VerECDSA   = 0
+	VerSchoCo  = 1
+	VerSchnorr = 2 // Schnorr puro sequencial
 )
 
 /* ============================================================
@@ -44,7 +53,7 @@ type LDNode struct {
 }
 
 /* ============================================================
-   Selective Disclosure claim (NEW)
+   Selective Disclosure claim
 ============================================================ */
 
 type SDClaim struct {
@@ -68,10 +77,9 @@ func marshalCanonical(v interface{}) ([]byte, error) {
 }
 
 /* ============================================================
-   Data → Merkle leaves (REVISED)
+   Data → Merkle leaves
 ============================================================ */
 
-// DataToLeaves now preserves semantic binding by embedding {id,value}
 func DataToLeaves(data map[string]interface{}) (keys []string, leaves [][]byte, err error) {
 	if data == nil {
 		return nil, nil, fmt.Errorf("nil data")
@@ -84,10 +92,7 @@ func DataToLeaves(data map[string]interface{}) (keys []string, leaves [][]byte, 
 	sort.Strings(keys)
 
 	for _, k := range keys {
-		leafObj := SDClaim{
-			ID:    k,
-			Value: data[k],
-		}
+		leafObj := SDClaim{ID: k, Value: data[k]}
 		b, err := marshalCanonical(leafObj)
 		if err != nil {
 			return nil, nil, fmt.Errorf("marshal SDClaim %s: %v", k, err)
@@ -96,10 +101,6 @@ func DataToLeaves(data map[string]interface{}) (keys []string, leaves [][]byte, 
 	}
 	return keys, leaves, nil
 }
-
-/* ============================================================
-   Attach SD root
-============================================================ */
 
 func AttachSDRootToPayload(p *Payload, data map[string]interface{}) (keys []string, leaves [][]byte, err error) {
 	if p == nil {
@@ -148,15 +149,13 @@ func ExtractSDRootFromPayload(p *Payload) ([]byte, bool) {
 }
 
 /* ============================================================
-   NEW: Semantic extraction from disclosure
+   Semantic extraction from disclosure
 ============================================================ */
 
-// ExtractSDClaimsFromDisclosure parses revealed leaves into SDClaim structs
 func ExtractSDClaimsFromDisclosure(d *sd.Disclosure) ([]SDClaim, error) {
 	if d == nil {
 		return nil, fmt.Errorf("nil disclosure")
 	}
-
 	var claims []SDClaim
 	for _, leaf := range d.Leaves {
 		var c SDClaim
@@ -171,41 +170,42 @@ func ExtractSDClaimsFromDisclosure(d *sd.Disclosure) ([]SDClaim, error) {
 	return claims, nil
 }
 
-// ----------------------------
-// Create / Extend / Validate (JWS, unchanged semantics)
-// ----------------------------
+/* ============================================================
+   Create / Extend / Validate (JWS)
+============================================================ */
 
-// NOTE: CreateJWS **does not** compute SD roots. Caller MUST call AttachSDRootToPayload before signing if SD is desired.
 func CreateJWS(payload *Payload, version int8, key interface{}) (string, error) {
 	payloadBytes, err := marshalCanonical(payload)
 	if err != nil {
 		return "", fmt.Errorf("marshal payload: %v", err)
 	}
-
 	header := map[string]interface{}{"version": version}
 	headerBytes, _ := json.Marshal(header)
 
 	var sigBytes []byte
 	switch version {
-	case 0:
+	case VerECDSA:
 		ecdsaKey, ok := key.(*ecdsa.PrivateKey)
 		if !ok {
-			return "", fmt.Errorf("version 0 requires *ecdsa.PrivateKey")
+			return "", fmt.Errorf("version %d requires *ecdsa.PrivateKey", version)
 		}
 		h := sha256.Sum256(payloadBytes)
 		sigBytes, err = ecdsaKey.Sign(rand.Reader, h[:], crypto.SHA256)
 		if err != nil {
 			return "", fmt.Errorf("ecdsa sign: %v", err)
 		}
-	case 1:
-		eddsaKey, ok := key.(kyber.Scalar)
+	case VerSchoCo, VerSchnorr:
+		sk, ok := key.(*edwards25519.Scalar)
 		if !ok {
-			return "", fmt.Errorf("version 1 requires kyber.Scalar")
+			return "", fmt.Errorf("version %d requires *edwards25519.Scalar", version)
 		}
-		sig := schoco.StdSign(string(payloadBytes), eddsaKey)
-		sigBytes, err = sig.ToByte()
+		sig, err := schoco.StdSign(payloadBytes, sk)
 		if err != nil {
-			return "", fmt.Errorf("schoco sign: %v", err)
+			return "", fmt.Errorf("StdSign: %v", err)
+		}
+		sigBytes, err = sig.MarshalBinary()
+		if err != nil {
+			return "", fmt.Errorf("MarshalBinary: %v", err)
 		}
 	default:
 		return "", fmt.Errorf("unsupported version: %d", version)
@@ -214,7 +214,6 @@ func CreateJWS(payload *Payload, version int8, key interface{}) (string, error) 
 	return strings.Join([]string{b64Encode(headerBytes), b64Encode(payloadBytes), b64Encode(sigBytes)}, "."), nil
 }
 
-// ExtendJWS: expects newPayload.Payload.Data already prepared (i.e., AttachSDRootToPayload already called if needed).
 func ExtendJWS(jws string, newNode *LDNode, version int8, key ...interface{}) (string, error) {
 	parts := strings.Split(jws, ".")
 	if len(parts) != 3 {
@@ -230,12 +229,9 @@ func ExtendJWS(jws string, newNode *LDNode, version int8, key ...interface{}) (s
 	}
 
 	switch version {
-	case 0:
-		// ID mode: previous full signature becomes node @id (base64)
-		newNodeID := b64Encode(sigB)
-		newNode.ID = newNodeID
+	case VerECDSA:
+		newNode.ID = b64Encode(sigB)
 		doc.List = append(doc.List, newNode)
-
 		if len(key) == 0 {
 			return "", fmt.Errorf("ecdsa key required")
 		}
@@ -243,37 +239,29 @@ func ExtendJWS(jws string, newNode *LDNode, version int8, key ...interface{}) (s
 		if !ok {
 			return "", fmt.Errorf("key is not *ecdsa.PrivateKey")
 		}
-
 		newPayloadBytes, _ := marshalCanonical(&doc)
 		h := sha256.Sum256(newPayloadBytes)
 		newSig, _ := ecdsaKey.Sign(rand.Reader, h[:], crypto.SHA256)
+		return strings.Join([]string{b64Encode(headerB), b64Encode(newPayloadBytes), b64Encode(newSig)}, "."), nil
 
-		var hdr map[string]interface{}
-		_ = json.Unmarshal(headerB, &hdr)
-		hdr["version"] = version
-		hdrB, _ := json.Marshal(hdr)
-
-		return strings.Join([]string{b64Encode(hdrB), b64Encode(newPayloadBytes), b64Encode(newSig)}, "."), nil
-
-	case 1:
-		// SchoCo mode: extract aggKey + R from previous signature, put R as @id, sign whole doc with aggKey
-		prevSig, err := schoco.ByteToSignature(sigB)
+	case VerSchoCo:
+		// SchoCo: previous signature provides the aggregation key (S) and the partial (R) becomes node ID.
+		prevSig, err := schoco.UnmarshalSignature(sigB)
 		if err != nil {
-			return "", fmt.Errorf("invalid previous signature: %v", err)
+			return "", fmt.Errorf("unmarshal previous signature: %v", err)
 		}
-		aggKey, partSig := prevSig.ExtractAggKey()
-		partSigBytes, err := schoco.PointToByte(partSig)
-		if err != nil {
-			return "", fmt.Errorf("PointToByte(partSig): %v", err)
-		}
-		newNodeID := b64Encode(partSigBytes)
-		newNode.ID = newNodeID
-
+		partSigB64 := b64Encode(prevSig.R.Bytes())
+		newNode.ID = partSigB64
 		doc.List = append(doc.List, newNode)
 
+		// Use aggregation key from previous signature (prevSig.S) to sign the new payload.
+		aggKey := prevSig.S
 		newPayloadBytes, _ := marshalCanonical(&doc)
-		newSig := schoco.StdSign(string(newPayloadBytes), aggKey)
-		newSigBytes, _ := newSig.ToByte()
+		newSig, err := schoco.StdSign(newPayloadBytes, aggKey)
+		if err != nil {
+			return "", fmt.Errorf("StdSign aggregate: %v", err)
+		}
+		newSigBytes, _ := newSig.MarshalBinary()
 
 		var hdr map[string]interface{}
 		_ = json.Unmarshal(headerB, &hdr)
@@ -282,18 +270,48 @@ func ExtendJWS(jws string, newNode *LDNode, version int8, key ...interface{}) (s
 
 		return strings.Join([]string{b64Encode(hdrB), b64Encode(newPayloadBytes), b64Encode(newSigBytes)}, "."), nil
 
+	case VerSchnorr:
+		// Schnorr puro sequencial: previous full signature becomes node ID, and caller must provide the schnorr private key
+		newNodeID := b64Encode(sigB) // full previous signature as node ID (sequential semantics)
+		newNode.ID = newNodeID
+		doc.List = append(doc.List, newNode)
+
+		if len(key) == 0 {
+			return "", fmt.Errorf("schnorr key required for extension")
+		}
+		sk, ok := key[0].(*edwards25519.Scalar)
+		if !ok {
+			return "", fmt.Errorf("schnorr extension requires *edwards25519.Scalar key")
+		}
+
+		newPayloadBytes, err := marshalCanonical(&doc)
+		if err != nil {
+			return "", fmt.Errorf("marshal canonical: %v", err)
+		}
+
+		newSig, err := schoco.StdSign(newPayloadBytes, sk)
+		if err != nil {
+			return "", fmt.Errorf("StdSign schnorr: %v", err)
+		}
+		newSigBytes, _ := newSig.MarshalBinary()
+
+		var hdr2 map[string]interface{}
+		_ = json.Unmarshal(headerB, &hdr2)
+		hdr2["version"] = version
+		hdrB2, _ := json.Marshal(hdr2)
+
+		return strings.Join([]string{b64Encode(hdrB2), b64Encode(newPayloadBytes), b64Encode(newSigBytes)}, "."), nil
+
 	default:
 		return "", fmt.Errorf("unsupported version: %d", version)
 	}
 }
 
-// ValidateJWS validates signatures (ID mode / SchoCo). It DOES NOT verify SD proofs; that is done by ValidateJWSWithPresentations.
 func ValidateJWS(jws string, version int8, bundle ...*Payload) (bool, error) {
 	parts := strings.Split(jws, ".")
 	if len(parts) != 3 {
 		return false, fmt.Errorf("invalid jws format")
 	}
-	// headerB, _ := b64Decode(parts[0])
 	payloadB, _ := b64Decode(parts[1])
 	sigB, _ := b64Decode(parts[2])
 
@@ -303,8 +321,96 @@ func ValidateJWS(jws string, version int8, bundle ...*Payload) (bool, error) {
 	}
 
 	switch version {
-	case 0:
+	case VerECDSA:
 		N := len(doc.List)
+		for k := 0; k < N; k++ {
+			partial := &Payload{
+				Ver:  doc.Ver,
+				Iat:  doc.Iat,
+				Iss:  doc.Iss,
+				Aud:  doc.Aud,
+				Sub:  doc.Sub,
+				Data: doc.Data,
+				List: doc.List[:k+1],
+			}
+			partialBytes, _ := marshalCanonical(partial)
+			var sigToCheck []byte
+			if k == N-1 {
+				sigToCheck = sigB
+			} else {
+				sigToCheck, _ = b64Decode(doc.List[k+1].ID)
+			}
+			var pubKeyBytes []byte
+			if doc.List[k].Payload.Iss != nil && len(doc.List[k].Payload.Iss.PK) > 0 {
+				pubKeyBytes = doc.List[k].Payload.Iss.PK
+			} else if len(bundle) > 0 {
+				if bundle[0].List != nil && len(bundle[0].List) > 0 && bundle[0].List[0].Payload.Sub != nil {
+					pubKeyBytes = bundle[0].List[0].Payload.Sub.PK
+				}
+			}
+			if len(pubKeyBytes) == 0 {
+				return false, fmt.Errorf("no public key available for step %d", k)
+			}
+			pub, err := x509.ParsePKIXPublicKey(pubKeyBytes)
+			if err != nil {
+				return false, fmt.Errorf("parse pkix pubkey (k=%d): %v", k, err)
+			}
+			h := sha256.Sum256(partialBytes)
+			if !ecdsa.VerifyASN1(pub.(*ecdsa.PublicKey), h[:], sigToCheck) {
+				return false, fmt.Errorf("signature failed at step %d", k)
+			}
+		}
+		return true, nil
+
+	case VerSchoCo:
+		// Agg verification path (unchanged)
+		N := len(doc.List)
+		lastSig, err := schoco.UnmarshalSignature(sigB)
+		if err != nil {
+			return false, fmt.Errorf("unmarshal lastSig: %v", err)
+		}
+		rootPK := new(edwards25519.Point)
+		if _, err := rootPK.SetBytes(doc.Iss.PK); err != nil {
+			return false, fmt.Errorf("SetBytes rootPK: %v", err)
+		}
+		var messages [][]byte
+		var partSigs []*edwards25519.Point
+		for i := N - 1; i >= 0; i-- {
+			node := doc.List[i]
+			idBytes, _ := b64Decode(node.ID)
+			pt, err := new(edwards25519.Point).SetBytes(idBytes)
+			if err != nil {
+				return false, fmt.Errorf("SetBytes partSig: %v", err)
+			}
+			partSigs = append(partSigs, pt)
+			p := &Payload{
+				Ver:  doc.Ver,
+				Iat:  doc.Iat,
+				Iss:  doc.Iss,
+				Aud:  doc.Aud,
+				Sub:  doc.Sub,
+				Data: doc.Data,
+				List: doc.List[:i],
+			}
+			b, _ := marshalCanonical(p)
+			messages = append(messages, b)
+		}
+		messages = append([][]byte{payloadB}, messages...)
+		if !schoco.Verify(rootPK, messages, partSigs, lastSig) {
+			return false, fmt.Errorf("SchoCo verification failed")
+		}
+		return true, nil
+
+	case VerSchnorr:
+		// Sequential Schnorr verification (mirror ECDSA sequential, but using edwards25519 sigs)
+		N := len(doc.List)
+
+		// root public key (used for all steps in sequential mode)
+		rootPK := new(edwards25519.Point)
+		if _, err := rootPK.SetBytes(doc.Iss.PK); err != nil {
+			return false, fmt.Errorf("SetBytes rootPK: %v", err)
+		}
+
 		for k := 0; k < N; k++ {
 			partial := &Payload{
 				Ver:  doc.Ver,
@@ -324,97 +430,14 @@ func ValidateJWS(jws string, version int8, bundle ...*Payload) (bool, error) {
 				sigToCheck, _ = b64Decode(doc.List[k+1].ID)
 			}
 
-			var pubKeyBytes []byte
-			if doc.List[k].Payload.Iss != nil && len(doc.List[k].Payload.Iss.PK) > 0 {
-				pubKeyBytes = doc.List[k].Payload.Iss.PK
-			} else if len(bundle) > 0 {
-				// fallback bundle (TTP bundle style)
-				if bundle[0].List != nil && len(bundle[0].List) > 0 && bundle[0].List[0].Payload.Sub != nil {
-					pubKeyBytes = bundle[0].List[0].Payload.Sub.PK
-				}
-			}
-
-			if len(pubKeyBytes) == 0 {
-				return false, fmt.Errorf("no public key available for step %d", k)
-			}
-
-			pub, err := x509.ParsePKIXPublicKey(pubKeyBytes)
+			sigStruct, err := schoco.UnmarshalSignature(sigToCheck)
 			if err != nil {
-				return false, fmt.Errorf("parse pkix pubkey (k=%d): %v", k, err)
+				return false, fmt.Errorf("byteToSignature (k=%d): %v", k, err)
 			}
-			h := sha256.Sum256(partialBytes)
-			if !ecdsa.VerifyASN1(pub.(*ecdsa.PublicKey), h[:], sigToCheck) {
-				return false, fmt.Errorf("signature failed at step %d", k)
-			}
-		}
-		return true, nil
 
-	case 1:
-		N := len(doc.List)
-
-		// non-extended (no nodes)
-		if N == 0 {
-			sig, err := schoco.ByteToSignature(sigB)
-			if err != nil {
-				return false, fmt.Errorf("byteToSignature: %v", err)
+			if !schoco.StdVerify(partialBytes, sigStruct, rootPK) {
+				return false, fmt.Errorf("schnorr signature failed at step %d", k)
 			}
-			rootPK, err := schoco.ByteToPoint(doc.Iss.PK)
-			if err != nil {
-				return false, fmt.Errorf("byteToPoint rootPK: %v", err)
-			}
-			msgBytes, _ := marshalCanonical(&doc)
-			if !schoco.StdVerify(string(msgBytes), sig, rootPK) {
-				return false, fmt.Errorf("StdVerify failed for non-extended token")
-			}
-			return true, nil
-		}
-
-		// extended case:
-		// build setMsg: OUTER (full list) -> ... -> INNER (empty list)
-		var setMsg []string
-		for i := N; i >= 0; i-- {
-			partial := &Payload{
-				Ver:  doc.Ver,
-				Iat:  doc.Iat,
-				Iss:  doc.Iss,
-				Aud:  doc.Aud,
-				Sub:  doc.Sub,
-				Data: doc.Data,
-				List: doc.List[:i], // i==0 -> empty slice
-			}
-			b, _ := marshalCanonical(partial)
-			setMsg = append(setMsg, string(b))
-		}
-
-		// build setPartSig: R_{N-1}, R_{N-2}, ..., R_0  (reverse order of doc.List)
-		var setPartSig []kyber.Point
-		for i := N - 1; i >= 0; i-- {
-			idBytes, err := b64Decode(doc.List[i].ID)
-			if err != nil {
-				return false, fmt.Errorf("decoding node ID to point (i=%d): %v", i, err)
-			}
-			pt, err := schoco.ByteToPoint(idBytes)
-			if err != nil {
-				return false, fmt.Errorf("ByteToPoint node ID (i=%d): %v", i, err)
-			}
-			setPartSig = append(setPartSig, pt)
-		}
-
-		// final aggregated signature
-		lastSig, err := schoco.ByteToSignature(sigB)
-		if err != nil {
-			return false, fmt.Errorf("byteToSignature final: %v", err)
-		}
-
-		// root public key = Iss.PK of the overall payload (doc.Iss)
-		rootPK, err := schoco.ByteToPoint(doc.Iss.PK)
-		if err != nil {
-			return false, fmt.Errorf("byteToPoint rootPK: %v", err)
-		}
-
-		// verify
-		if !schoco.Verify(rootPK, setMsg, setPartSig, lastSig) {
-			return false, fmt.Errorf("schoco verification failed")
 		}
 		return true, nil
 
@@ -423,27 +446,19 @@ func ValidateJWS(jws string, version int8, bundle ...*Payload) (bool, error) {
 	}
 }
 
-// ----------------------------
-// Presentation helpers (using your sd package)
-// ----------------------------
+/* ============================================================
+   Presentation helpers
+============================================================ */
 
-// CreateDisclosureFromLeaves is a thin wrapper around sd.CreateDisclosure.
-// leaves should be the canonical leaves used when creating the root (DataToLeaves).
 func CreateDisclosureFromLeaves(leaves [][]byte, selectedIndices []int) (*sd.Disclosure, error) {
 	return sd.CreateDisclosure(leaves, selectedIndices)
 }
 
-// CreatePresentationFromData convenience: given the original data map (the cleartext map),
-// create canonical leaves, map selectedKeys -> indices, and call sd.CreateDisclosure.
 func CreatePresentationFromData(data map[string]interface{}, selectedKeys []string) (*sd.Disclosure, error) {
-	if data == nil {
-		return nil, fmt.Errorf("nil data")
-	}
 	keysOrder, leaves, err := DataToLeaves(data)
 	if err != nil {
 		return nil, err
 	}
-	// map key -> index
 	keyToIndex := make(map[string]int, len(keysOrder))
 	for i, k := range keysOrder {
 		keyToIndex[k] = i
@@ -459,29 +474,18 @@ func CreatePresentationFromData(data map[string]interface{}, selectedKeys []stri
 	return sd.CreateDisclosure(leaves, indices)
 }
 
-// Validate presentation: check that disclosure is internally consistent and that its Root
-// matches the root stored in the payload's Data metadata.
-//
-// presentations map: key = 0 -> root payload; key = i+1 -> doc.List[i]
 func ValidateJWSWithPresentations(jws string, version int8, presentations map[int]*sd.Disclosure, bundle ...*Payload) (bool, error) {
-	// validate signatures first
 	ok, err := ValidateJWS(jws, version, bundle...)
 	if err != nil || !ok {
 		return false, err
 	}
-
 	parts := strings.Split(jws, ".")
-	if len(parts) != 3 {
-		return false, fmt.Errorf("invalid jws format")
-	}
 	payloadB, _ := b64Decode(parts[1])
-
 	var doc Payload
 	if err := json.Unmarshal(payloadB, &doc); err != nil {
 		return false, fmt.Errorf("unmarshal payload: %v", err)
 	}
 
-	// helper to verify a disclosure against a payload node
 	verifyNode := func(nodePayload *Payload, pres *sd.Disclosure) (bool, error) {
 		if nodePayload == nil {
 			return false, fmt.Errorf("nil node payload")
@@ -500,21 +504,18 @@ func ValidateJWSWithPresentations(jws string, version int8, presentations map[in
 		return true, nil
 	}
 
-	// check root payload (presentation key 0)
 	if pres, ok := presentations[0]; ok {
 		if _, err := verifyNode(&doc, pres); err != nil {
 			return false, err
 		}
 	}
 
-	// check each child node -> presentation key i+1
 	for i, node := range doc.List {
 		if node == nil || node.Payload == nil {
 			continue
 		}
 		pres, ok := presentations[i+1]
 		if !ok {
-			// if node declares SD root, presentation missing is a failure
 			if _, has := ExtractSDRootFromPayload(node.Payload); has {
 				return false, fmt.Errorf("missing presentation for node %d", i+1)
 			}
@@ -524,6 +525,5 @@ func ValidateJWSWithPresentations(jws string, version int8, presentations map[in
 			return false, err
 		}
 	}
-
 	return true, nil
 }
