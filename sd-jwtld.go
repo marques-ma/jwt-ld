@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	sd "github.com/marques-ma/merkle-selective-disclosure"
 	"github.com/hpe-usp-spire/schoco"
@@ -171,6 +172,19 @@ func ExtractSDClaimsFromDisclosure(d *sd.Disclosure) ([]SDClaim, error) {
 }
 
 /* ============================================================
+   Validate caching for SchoCo heavy prep work
+   (cache key: exact payload bytes from JWS)
+============================================================ */
+
+var schocoVerifyCache sync.Map // map[string]*schocoCacheEntry
+
+type schocoCacheEntry struct {
+	rootPK   *edwards25519.Point
+	messages [][]byte
+	partSigs []*edwards25519.Point
+}
+
+/* ============================================================
    Create / Extend / Validate (JWS)
 ============================================================ */
 
@@ -268,6 +282,9 @@ func ExtendJWS(jws string, newNode *LDNode, version int8, key ...interface{}) (s
 		hdr["version"] = version
 		hdrB, _ := json.Marshal(hdr)
 
+		// Invalidate cache for this JWS payload (the payload bytes changed)
+		// Note: old payloadB string was key for cache; it will be different for newPayloadBytes, so no need to delete explicitly.
+
 		return strings.Join([]string{b64Encode(hdrB), b64Encode(newPayloadBytes), b64Encode(newSigBytes)}, "."), nil
 
 	case VerSchnorr:
@@ -363,40 +380,66 @@ func ValidateJWS(jws string, version int8, bundle ...*Payload) (bool, error) {
 		return true, nil
 
 	case VerSchoCo:
-		// Agg verification path (unchanged)
+		// Agg verification path with caching of heavy prep work (messages, partSigs, rootPK)
 		N := len(doc.List)
 		lastSig, err := schoco.UnmarshalSignature(sigB)
 		if err != nil {
 			return false, fmt.Errorf("unmarshal lastSig: %v", err)
 		}
-		rootPK := new(edwards25519.Point)
-		if _, err := rootPK.SetBytes(doc.Iss.PK); err != nil {
-			return false, fmt.Errorf("SetBytes rootPK: %v", err)
-		}
-		var messages [][]byte
-		var partSigs []*edwards25519.Point
-		for i := N - 1; i >= 0; i-- {
-			node := doc.List[i]
-			idBytes, _ := b64Decode(node.ID)
-			pt, err := new(edwards25519.Point).SetBytes(idBytes)
-			if err != nil {
-				return false, fmt.Errorf("SetBytes partSig: %v", err)
+
+		// key for cache is the exact payload bytes as present in the JWS
+		cacheKey := string(payloadB)
+
+		var entry *schocoCacheEntry
+		if v, ok := schocoVerifyCache.Load(cacheKey); ok {
+			entry = v.(*schocoCacheEntry)
+		} else {
+			// build fresh cache entry
+			rootPK := new(edwards25519.Point)
+			if _, err := rootPK.SetBytes(doc.Iss.PK); err != nil {
+				return false, fmt.Errorf("SetBytes rootPK: %v", err)
 			}
-			partSigs = append(partSigs, pt)
-			p := &Payload{
-				Ver:  doc.Ver,
-				Iat:  doc.Iat,
-				Iss:  doc.Iss,
-				Aud:  doc.Aud,
-				Sub:  doc.Sub,
-				Data: doc.Data,
-				List: doc.List[:i],
+
+			// messages[0] = payload final (payloadB)
+			// messages[1] = payload with List[:N-1]
+			// messages[2] = payload with List[:N-2]
+			// ...
+			messages := make([][]byte, 0, N+1)
+			messages = append(messages, payloadB)
+
+			// partSigs in order: R_{N-1}, R_{N-2}, ..., R_0
+			partSigs := make([]*edwards25519.Point, 0, N)
+			for i := N - 1; i >= 0; i-- {
+				node := doc.List[i]
+				idBytes, _ := b64Decode(node.ID)
+				pt, err := new(edwards25519.Point).SetBytes(idBytes)
+				if err != nil {
+					return false, fmt.Errorf("SetBytes partSig: %v", err)
+				}
+				partSigs = append(partSigs, pt)
+
+				p := &Payload{
+					Ver:  doc.Ver,
+					Iat:  doc.Iat,
+					Iss:  doc.Iss,
+					Aud:  doc.Aud,
+					Sub:  doc.Sub,
+					Data: doc.Data,
+					List: doc.List[:i],
+				}
+				b, _ := marshalCanonical(p)
+				messages = append(messages, b)
 			}
-			b, _ := marshalCanonical(p)
-			messages = append(messages, b)
+
+			entry = &schocoCacheEntry{
+				rootPK:   rootPK,
+				messages: messages,
+				partSigs: partSigs,
+			}
+			schocoVerifyCache.Store(cacheKey, entry)
 		}
-		messages = append([][]byte{payloadB}, messages...)
-		if !schoco.Verify(rootPK, messages, partSigs, lastSig) {
+
+		if !schoco.Verify(entry.rootPK, entry.messages, entry.partSigs, lastSig) {
 			return false, fmt.Errorf("SchoCo verification failed")
 		}
 		return true, nil
