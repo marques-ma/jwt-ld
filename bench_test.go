@@ -15,9 +15,12 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-var extCounts = []int{0, 2, 4, 8, 16, 32, 64}
-
 var (
+
+	useSDFlag []bool = []bool{false, true}
+	algFlag []string = []string{"ECDSA", "SchoCo", "Schnorr"}
+	ExtCountsFlag  = []int{0,2,4,8,16,32,64}   
+
 	ecdsaPriv *ecdsa.PrivateKey
 	ecdsaPub  []byte
 
@@ -85,12 +88,9 @@ func init() {
 
 func buildJWTBaseline(scopes []string) (string, error) {
 	claims := jwt.MapClaims{
-		"iss":   "https://issuer.example",
-		"sub":   "agent-123",
-		"aud":   "server",
+		"iss":   "spiffe://example.org/AS",
+		"aud":   "sipffe://example.org/Agent",
 		"iat":   time.Now().Unix(),
-		"exp":   time.Now().Add(5 * time.Minute).Unix(),
-		"scope": scopes,
 	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	return tok.SignedString(jwtPriv)
@@ -189,40 +189,61 @@ func buildToken(alg string, useSD bool, extCount int) (string, map[int]*sd.Discl
 // ----------------------------- BENCHMARKS -----------------------------
 
 func Benchmark_GenScaling(b *testing.B) {
-	for _, alg := range []string{"ECDSA", "SchoCo", "Schnorr"} {
-		for _, useSD := range []bool{false, true} {
+	for _, alg := range algFlag {
+		for _, useSD := range useSDFlag {
 			sdLabel := "NoSD"
 			if useSD {
 				sdLabel = "SD"
 			}
-			for _, ext := range extCounts {
-				name := fmt.Sprintf("%s_%s_Ext_%d/Gen", alg, sdLabel, ext)
-				b.Run(name, func(b *testing.B) {
-					var totalSize uint64
-					b.ResetTimer()
-					for i := 0; i < b.N; i++ {
-						jws, _, err := buildToken(alg, useSD, ext)
-						if err != nil {
-							b.Fatalf("buildToken error: %v", err)
-						}
-						totalSize += uint64(len(jws))
+
+			name := fmt.Sprintf("%s_%s/BaseToken/Gen", alg, sdLabel)
+			b.Run(name, func(b *testing.B) {
+				// Payload base: apenas claims iniciais (não extensões)
+				var root *Payload
+				var ver int8
+				switch alg {
+				case "ECDSA":
+					ver = VerECDSA
+					root = &Payload{Ver: ver, Iat: payloadECDSA.Iat, Iss: payloadECDSA.Iss}
+				case "SchoCo":
+					ver = VerSchoCo
+					root = &Payload{Ver: ver, Iat: payloadSchoCo.Iat, Iss: payloadSchoCo.Iss}
+				case "Schnorr":
+					ver = VerSchnorr
+					root = &Payload{Ver: ver, Iat: payloadSchnorr.Iat, Iss: payloadSchnorr.Iss}
+				}
+
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					var jws string
+					var err error
+					switch alg {
+					case "ECDSA":
+						jws, err = CreateJWS(root, ver, ecdsaPriv)
+					case "SchoCo":
+						jws, err = CreateJWS(root, ver, schocoSk)
+					case "Schnorr":
+						jws, err = CreateJWS(root, ver, schnorrSk)
 					}
-					avg := float64(totalSize) / float64(b.N)
-					b.ReportMetric(avg, "bytes")
-				})
-			}
+					if err != nil {
+						b.Fatalf("create base token failed: %v", err)
+					}
+					b.ReportMetric(float64(len(jws)), "bytes")
+				}
+			})
 		}
 	}
 }
 
+
 func Benchmark_ExtendScaling(b *testing.B) {
-	for _, alg := range []string{"ECDSA", "SchoCo", "Schnorr"} {
-		for _, useSD := range []bool{false, true} {
+	for _, alg := range algFlag {
+		for _, useSD := range useSDFlag {
 			sdLabel := "NoSD"
 			if useSD {
 				sdLabel = "SD"
 			}
-			for _, ext := range extCounts {
+			for _, ext := range ExtCountsFlag {
 				name := fmt.Sprintf("%s_%s_Ext_%d/ExtendOne", alg, sdLabel, ext)
 				b.Run(name, func(b *testing.B) {
 					baseLen := ext - 1
@@ -278,13 +299,13 @@ func Benchmark_ExtendScaling(b *testing.B) {
 }
 
 func Benchmark_ValidateScaling(b *testing.B) {
-	for _, alg := range []string{"ECDSA", "SchoCo", "Schnorr"} {
-		for _, useSD := range []bool{false, true} {
+	for _, alg := range algFlag {
+		for _, useSD := range useSDFlag {
 			sdLabel := "NoSD"
 			if useSD {
 				sdLabel = "SD"
 			}
-			for _, ext := range extCounts {
+			for _, ext := range ExtCountsFlag {
 				name := fmt.Sprintf("%s_%s_Ext_%d/Validate", alg, sdLabel, ext)
 				b.Run(name, func(b *testing.B) {
 					jws, pres, err := buildToken(alg, useSD, ext)
@@ -324,74 +345,96 @@ func Benchmark_ValidateScaling(b *testing.B) {
 	}
 }
 
-func Benchmark_JWTBaseline_GenScaling(b *testing.B) {
-	for _, ext := range extCounts {
-		name := fmt.Sprintf("JWTBaseline_Ext_%d/Gen", ext)
-		b.Run(name, func(b *testing.B) {
-			var totalSize uint64
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				for j := 0; j <= ext; j++ {
-					scopes := make([]string, j+1)
-					for k := 0; k <= j; k++ {
-						scopes[k] = fmt.Sprintf("perm.%d", k)
-					}
-					jws, err := buildJWTBaseline(scopes)
-					if err != nil {
-						b.Fatalf("jwt gen failed: %v", err)
-					}
-					totalSize += uint64(len(jws))
-				}
-			}
-			avg := float64(totalSize) / float64(b.N)
-			b.ReportMetric(avg, "bytes")
-		})
-	}
-}
 
 func Benchmark_JWTBaseline_ExtendOne(b *testing.B) {
-	for _, ext := range extCounts {
-		name := fmt.Sprintf("JWTBaseline_Ext_%d/ExtendOne", ext)
-		b.Run(name, func(b *testing.B) {
-			scopes := make([]string, ext+1)
-			for i := 0; i <= ext; i++ {
-				scopes[i] = fmt.Sprintf("perm.%d", i)
-			}
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				_, err := buildJWTBaseline(scopes)
-				if err != nil {
-					b.Fatalf("jwt extend failed: %v", err)
-				}
-			}
-		})
-	}
+    for _, ext := range ExtCountsFlag {
+        name := fmt.Sprintf("JWTBaseline_Ext_%d/ExtendOne", ext)
+        b.Run(name, func(b *testing.B) {
+            // Criar token base com ext-1 escopos
+            baseScopes := make([]string, ext)
+            for i := 0; i < ext; i++ {
+                baseScopes[i] = fmt.Sprintf("perm.%d", i)
+            }
+
+            // Serializar token base uma vez antes do benchmark
+            _, err := buildJWTBaseline(baseScopes)
+            if err != nil {
+                b.Fatalf("jwt build base failed: %v", err)
+            }
+
+            b.ResetTimer()
+            for i := 0; i < b.N; i++ {
+                // Criar cópia do array de escopos e adicionar 1 novo escopo
+                scopes := append([]string{}, baseScopes...)
+                scopes = append(scopes, fmt.Sprintf("perm.%d", ext+i))
+
+                // Gerar o token estendido
+                _, err := buildJWTBaseline(scopes)
+                if err != nil {
+                    b.Fatalf("jwt extend failed: %v", err)
+                }
+            }
+        })
+    }
 }
 
-func Benchmark_JWTBaseline_ValidateScaling(b *testing.B) {
-	for _, ext := range extCounts {
-		name := fmt.Sprintf("JWTBaseline_Ext_%d/Validate", ext)
+func Benchmark_JWTBaseline_Gen(b *testing.B) {
+	for _, ext := range ExtCountsFlag {
+		name := fmt.Sprintf("JWTBaseline_Ext_%d/Gen", ext)
 		b.Run(name, func(b *testing.B) {
-			var tokens []string
+			// Payload base com ext claims
+			claims := make([]string, ext)
+			for i := 0; i < ext; i++ {
+				claims[i] = fmt.Sprintf("perm.%d", i)
+			}
+
 			var totalSize uint64
-			for j := 0; j <= ext; j++ {
-				scopes := make([]string, j+1)
-				for k := 0; k <= j; k++ {
-					scopes[k] = fmt.Sprintf("perm.%d", k)
-				}
-				jws, err := buildJWTBaseline(scopes)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				jws, err := buildJWTBaseline(claims)
 				if err != nil {
 					b.Fatalf("jwt gen failed: %v", err)
 				}
-				tokens = append(tokens, jws)
 				totalSize += uint64(len(jws))
 			}
-			b.ReportMetric(float64(totalSize), "bytes")
+
+			avg := float64(totalSize) / float64(b.N)
+			b.ReportMetric(avg, "bytes") // tamanho médio do token
+		})
+	}
+}
+
+func Benchmark_JWTBaseline_Validate(b *testing.B) {
+	for _, ext := range ExtCountsFlag {
+		name := fmt.Sprintf("JWTBaseline_Ext_%d/ValidateRealistic", ext)
+		b.Run(name, func(b *testing.B) {
+			// Garantir pelo menos 1 token
+			numTokens := ext
+			if numTokens == 0 {
+				numTokens = 1
+			}
+			numClaims := ext
+
+			// Criar tokens independentes com numClaims cada
+			tokens := make([]string, numTokens)
+			for i := 0; i < numTokens; i++ {
+				claims := make([]string, numClaims)
+				for j := 0; j < numClaims; j++ {
+					claims[j] = fmt.Sprintf("perm.%d", j)
+				}
+				jws, err := buildJWTBaseline(claims)
+				if err != nil {
+					b.Fatalf("jwt gen failed: %v", err)
+				}
+				tokens[i] = jws
+			}
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				for _, tok := range tokens {
-					if err := parseAndValidateJWT(tok); err != nil {
+					if _, err := jwt.Parse(tok, func(token *jwt.Token) (interface{}, error) {
+						return jwtPub, nil
+					}); err != nil {
 						b.Fatalf("jwt validate failed: %v", err)
 					}
 				}
